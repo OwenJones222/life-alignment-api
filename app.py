@@ -11,8 +11,8 @@ app = FastAPI()
 
 # Allow your WordPress domain to POST here
 ALLOWED_ORIGINS = [
-    "https://YOUR-WORDPRESS-DOMAIN.com",      # ← replace
-    "https://www.YOUR-WORDPRESS-DOMAIN.com",  # ← replace
+    "https://queensparkfitness.com",      
+    "https://www.queensparkfitness.com",  
 ]
 app.add_middleware(
     CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
