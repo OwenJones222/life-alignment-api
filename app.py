@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -9,14 +10,15 @@ from generate_report_json import build_pdf_from_payload  # you create this next
 
 app = FastAPI()
 
-# Allow your WordPress domain to POST here
-ALLOWED_ORIGINS = [
-    "https://queensparkfitness.com",      
-    "https://www.queensparkfitness.com",  
-]
+# Allow your site to POST here (TEMP: wide-open for testing)
+ALLOWED_ORIGINS = ["*"]  # <-- after testing, change to your domains
+
 app.add_middleware(
-    CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 class Submission(BaseModel):
@@ -36,8 +38,7 @@ def generate(sub: Submission):
         # Build the PDF from the payload (no Excel needed)
         build_pdf_from_payload(sub.dict(), out_path)
 
-        # MVP: return a simple success. (Your page already shows “Thanks!” on 200 OK.)
-        # Later: upload to S3/Cloudflare R2 and return a download_url, or email it.
+        # MVP: simple success; later return a download link or email it
         return {"ok": True, "file": report_name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
