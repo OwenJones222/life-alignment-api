@@ -1,11 +1,12 @@
 # app.py — FastAPI for Life Alignment API
 # - Tolerant /generate endpoint (per-subtheme ranks or legacy).
-# - Dynamic report builder from generate_report_json.py.
-# - Built-in Gmail SMTP sender (no external mailer module).
+# - Robust dynamic resolver for the PDF builder in generate_report_json.py.
+# - Built-in Gmail SMTP sending (uses EMAIL_USER + EMAIL_APP_PASSWORD env vars).
 
 import os
 import smtplib
 import ssl
+import inspect
 from email.message import EmailMessage
 from mimetypes import guess_type
 
@@ -20,10 +21,15 @@ import generate_report_json as _report_mod  # your existing file
 
 def _resolve_report_builder():
     """
-    Find a callable in generate_report_json that builds a PDF and returns the path.
-    Tries multiple common names so we don't break if the function name differs.
+    Resolve a callable from generate_report_json that builds a PDF and returns its path.
+
+    Resolution order:
+      1) Env var REPORT_FUNC if it matches a callable in the module.
+      2) Preferred names (common guesses).
+      3) Any public callable whose name contains 'report'.
+      4) Any public callable that appears to take a single payload parameter.
     """
-    candidates = (
+    preferred = (
         "build_pdf_report",
         "generate_pdf_report",
         "create_pdf_from_payload",
@@ -31,14 +37,63 @@ def _resolve_report_builder():
         "build_report",
         "generate_report",
     )
-    for name in candidates:
+
+    # 0) Dump available public callables for visibility in Render logs
+    public_callables = []
+    for name in dir(_report_mod):
+        if name.startswith("_"):
+            continue
+        obj = getattr(_report_mod, name)
+        if callable(obj):
+            public_callables.append(name)
+    print(f"[report] Public callables in generate_report_json: {public_callables}")
+
+    # 1) Explicit env override
+    env_name = os.getenv("REPORT_FUNC")
+    if env_name:
+        fn = getattr(_report_mod, env_name, None)
+        if callable(fn):
+            print(f"[report] Using REPORT_FUNC override: {env_name}()")
+            return fn
+        else:
+            print(f"[report] REPORT_FUNC='{env_name}' not found/callable.")
+
+    # 2) Preferred names
+    for name in preferred:
         fn = getattr(_report_mod, name, None)
         if callable(fn):
             print(f"[report] Using builder function: {name}()")
             return fn
+
+    # 3) Any callable containing 'report'
+    for name in public_callables:
+        if "report" in name.lower():
+            fn = getattr(_report_mod, name, None)
+            if callable(fn):
+                print(f"[report] Using heuristic (contains 'report'): {name}()")
+                return fn
+
+    # 4) Any callable with a 1-parameter signature (payload-like)
+    for name in public_callables:
+        fn = getattr(_report_mod, name, None)
+        if not callable(fn):
+            continue
+        try:
+            sig = inspect.signature(fn)
+            # Accept 1 positional OR (**kwargs) style
+            params = [p for p in sig.parameters.values()
+                      if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_KEYWORD)]
+            if len(params) >= 1:
+                print(f"[report] Using generic 1-param callable: {name}()")
+                return fn
+        except Exception:
+            continue
+
     raise ImportError(
         "No suitable report builder found in generate_report_json.py. "
-        "Expected one of: " + ", ".join(candidates)
+        "Set env REPORT_FUNC to the exact function name, or expose one callable "
+        "that accepts the normalized payload and returns a PDF file path. "
+        f"Available public callables: {public_callables}"
     )
 
 
@@ -51,7 +106,6 @@ ALLOWED_ORIGINS = [
     "https://queensparkfitness.com",
     "https://www.queensparkfitness.com",
 ]
-# Optionally override via env (comma-separated)
 _env_origins = os.getenv("ALLOWED_ORIGINS")
 if _env_origins:
     ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
@@ -69,16 +123,12 @@ app.add_middleware(
 # Email sender (Gmail SMTP)
 # ----------------------------
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))  # STARTTLS port
-EMAIL_USER = os.getenv("EMAIL_USER", "")  # your full Gmail address
-EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")  # 16-char app password
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))  # STARTTLS
+EMAIL_USER = os.getenv("EMAIL_USER", "")
+EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")
 
 
 def send_email_with_attachment(to: str, subject: str, body: str, attachment_path: str):
-    """
-    Sends an email with a single attachment via Gmail SMTP (App Password).
-    Non-HTML body (plain text). Raises on connection/auth errors.
-    """
     if not EMAIL_USER or not EMAIL_APP_PASSWORD:
         raise RuntimeError("EMAIL_USER or EMAIL_APP_PASSWORD env vars are not set.")
 
@@ -88,13 +138,16 @@ def send_email_with_attachment(to: str, subject: str, body: str, attachment_path
     msg["Subject"] = subject
     msg.set_content(body)
 
-    # Attach file if present
     if attachment_path and os.path.isfile(attachment_path):
         mime_type, _ = guess_type(attachment_path)
         maintype, subtype = (mime_type or "application/pdf").split("/", 1)
         with open(attachment_path, "rb") as f:
-            msg.add_attachment(f.read(), maintype=maintype, subtype=subtype,
-                               filename=os.path.basename(attachment_path))
+            msg.add_attachment(
+                f.read(),
+                maintype=maintype,
+                subtype=subtype,
+                filename=os.path.basename(attachment_path),
+            )
     else:
         print(f"[email] Warning: attachment not found: {attachment_path}")
 
@@ -193,7 +246,6 @@ async def generate(request: Request):
             attachment_path=pdf_path,
         )
     except Exception as e:
-        # Still return 200; the PDF exists and can be re-sent.
         print("ERROR while emailing:", repr(e))
 
     return {"ok": True}
