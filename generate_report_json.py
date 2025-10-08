@@ -1,354 +1,459 @@
-# -*- coding: utf-8 -*-
-# Robust PDF builder for web payloads (per-subtheme labels, ranks above bars, wildcards)
-#
-# Public API:
-#   build_pdf_report(payload: dict, out_pdf: str)
+# generate_report_json.py
+# Full replacement – tolerant input parsing, pillar charts with ranks above bars,
+# real sub-theme labels, no weight text, spiderweb disabled.
 
-import os
-import numpy as np
+import io
+import json
 from datetime import datetime
 
+# Matplotlib / plotting
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 
+# ReportLab / PDF
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.lib.units import cm
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image as RLImage
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Image,
+    PageBreak,
+    Table,
+    TableStyle,
 )
 
-# ---------- constants ----------
-PILLAR_KEYS     = ["wealth", "health", "self", "social"]
-PILLAR_ORDER    = ["Wealth", "Health", "Self", "Social"]
-PILLAR_COLOURS  = {
-    "wealth": "#FFD700",
-    "health": "#5CB85C",
-    "self":   "#5BC0DE",
-    "social": "#9B59B6",
+# -----------------------------
+# Switches / diagnostics
+# -----------------------------
+DRAW_SPIDER = False   # temporarily disabled
+DEBUG_LOG   = True    # prints short parsing logs to Render logs
+
+# -----------------------------
+# Canonical structure & labels
+# -----------------------------
+PILLARS = ["health", "wealth", "self", "social"]
+
+SUBTHEMES = {
+    "health": ["Physical Energy", "Mental Health", "Workload / Balance", "Preventative Care"],
+    "wealth": ["Income Stability", "Retirement & Pensions", "Lifestyle & Security", "Habits & Knowledge"],
+    "self":   ["Purpose & Direction", "Growth & Learning", "Mindset & Resilience", "Joy & Fulfilment"],
+    "social": ["Family & Relationships", "Professional Networks", "Community & Belonging", "Contribution & Impact"],
 }
-CHARTS_DIR = "charts_tmp"
 
+PILLAR_TITLES = {
+    "health": "Health Pillar",
+    "wealth": "Wealth Pillar",
+    "self":   "Self Pillar",
+    "social": "Social Pillar",
+}
 
-# ---------- helpers ----------
-def _safe_get(d, *path, default=None):
-    cur = d
-    for k in path:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
+PILLAR_COLORS = {
+    "health": "#28a745",  # green-ish
+    "wealth": "#f1c232",  # amber
+    "self":   "#4ea1d3",  # blue
+    "social": "#9b59b6",  # purple
+}
 
-def _pillar_meta(payload):
-    """
-    Returns: dict pillar_key -> {'label': str, 'subthemes': [4 names]}
-    Accepts meta in multiple shapes, falls back to Theme 1..4.
-    """
-    result = {}
-    meta_pillars = _safe_get(payload, "meta", "pillars", default=[]) or []
-    if isinstance(meta_pillars, list):
-        for item in meta_pillars:
-            key   = str(item.get("key", "")).strip().lower()
-            label = (item.get("label") or key.title() or "").strip()
-            subs  = (item.get("subthemes") or item.get("subs") or [])
-            if not isinstance(subs, list):
-                subs = []
-            while len(subs) < 4:
-                subs.append(f"Theme {len(subs)+1}")
-            subs = subs[:4]
-            if key in PILLAR_KEYS:
-                result[key] = {"label": label or key.title(), "subthemes": subs}
+# rank -> weight
+RANK_WEIGHT = {1: 4, 2: 3, 3: 2, 4: 1}
 
-    for k, nice in zip(PILLAR_KEYS, PILLAR_ORDER):
-        if k not in result:
-            result[k] = {"label": nice, "subthemes": [f"Theme {i}" for i in range(1,5)]}
-    return result
+# -------------- Input parsing (tolerant) --------------
 
-def _read_ranks(payload, pillar_key):
-    """
-    Returns 4 integers 1..4 (1 = most important). Tolerant to strings/None.
-    """
-    arr = _safe_get(payload, "importance", pillar_key, default=None)
-    if isinstance(arr, list) and len(arr) == 4:
-        cleaned = []
-        for x in arr:
-            try:
-                xi = int(x)
-            except Exception:
-                xi = 2
-            cleaned.append(max(1, min(4, xi)))
-        return cleaned
-    return [2, 2, 2, 2]
-
-def _chunk_sum(vals, size=5, chunks=4):
-    out, i = [], 0
-    for _ in range(chunks):
-        part = vals[i:i+size]
-        out.append(sum(v for v in part if isinstance(v, (int, float))))
-        i += size
-    while len(out) < 4:
-        out.append(0)
-    return out[:4]
-
-def _read_sub_scores(payload, pillar_key):
-    """
-    Returns 4 numbers (0..25) — tolerant to several field names:
-      subtotals[p], subtheme_totals[p], sub_scores[p], scores[p],
-      pillars[p].subs, or group ratings[p] by 5.
-    """
-    for path in [
-        ("subtotals", pillar_key),
-        ("subtheme_totals", pillar_key),
-        ("sub_scores", pillar_key),
-        ("scores", pillar_key),
-    ]:
-        arr = _safe_get(payload, *path, default=None)
-        if isinstance(arr, list) and len(arr) >= 4:
-            return [float(arr[i]) if i < len(arr) else 0.0 for i in range(4)]
-
-    arr = _safe_get(payload, "pillars", pillar_key, "subs", default=None)
-    if isinstance(arr, list) and len(arr) >= 4:
-        return [float(arr[i]) if i < len(arr) else 0.0 for i in range(4)]
-
-    arr = _safe_get(payload, "ratings", pillar_key, default=None)
-    if isinstance(arr, list) and len(arr) >= 20:
-        return _chunk_sum(arr, size=5, chunks=4)
-
-    return [0.0, 0.0, 0.0, 0.0]
-
-def _weights_from_ranks(ranks):
-    # 1 = most important -> adjusted 4; 4 -> 1
-    adjusted = [5 - r for r in ranks]
-    mean_adj = np.mean(adjusted) if adjusted else 1.0
-    if not mean_adj:
-        mean_adj = 1.0
-    return [a / mean_adj for a in adjusted]
-
-def _largest_gap(pillars_dict):
-    best = ("", -1, -1.0)
-    for pk, rec in pillars_dict.items():
-        raw, fac = rec["raw"], rec["factors"]
-        for i in range(4):
-            gap = fac[i] * max(0, 25 - raw[i])
-            if gap > best[2]:
-                best = (pk, i, gap)
-    return best
-
-def _read_wildcards(payload, pillar_key):
-    """
-    Returns a list of (question, answer) for a pillar.
-    Accepts:
-      payload["wildcards"][pillar] -> list of {'q','a'} or {'question','answer'} or strings
-      legacy: payload['wild_health'], etc. (single string)
-    """
+def _as_int_list(x):
     out = []
-
-    wc = _safe_get(payload, "wildcards", pillar_key, default=None)
-    if isinstance(wc, list):
-        for item in wc:
-            if isinstance(item, dict):
-                q = item.get("q") or item.get("question") or ""
-                a = item.get("a") or item.get("answer") or ""
-                if q or a:
-                    out.append((str(q).strip(), str(a).strip()))
-            elif isinstance(item, str) and item.strip():
-                out.append(("", item.strip()))
-
-    legacy_key = {
-        "health": "wild_health",
-        "wealth": "wild_wealth",
-        "self":   "wild_self",
-        "social": "wild_social",
-    }[pillar_key]
-    legacy_val = payload.get(legacy_key)
-    if isinstance(legacy_val, str) and legacy_val.strip():
-        out.append(("", legacy_val.strip()))
-
+    for v in (x or []):
+        if v in ("", None):
+            out.append(0)
+        else:
+            try:
+                out.append(int(v))
+            except Exception:
+                try:
+                    out.append(int(round(float(v))))
+                except Exception:
+                    out.append(0)
     return out
 
+def _try_new_shape(data, pillar):
+    """
+    New shape from the updated form:
+      data["ratings"][pillar] -> [0..5] * 4
+      data["ranks_per_subtheme"][pillar] -> [1..4] * 4
+    """
+    ratings = None
+    ranks   = None
+    if isinstance(data.get("ratings"), dict):
+        ratings = _as_int_list(data["ratings"].get(pillar))
+        if len(ratings) != 4:
+            ratings = None
+    if isinstance(data.get("ranks_per_subtheme"), dict):
+        ranks = _as_int_list(data["ranks_per_subtheme"].get(pillar))
+        if len(ranks) != 4:
+            ranks = None
+    return ratings, ranks
 
-# ---------- plotting ----------
-def _bar_chart(pillar_label, pillar_key, sub_names, raw, wtd, ranks):
+def _try_legacy_shape(data, pillar):
     """
-    Draws bars and places 'rank N' ABOVE each subtheme pair.
-    Sub-theme labels are the x-tick labels (below bars).
+    Older versions we used early on:
+      data["scores"][pillar][subkey] -> 0..5 (dict) *or* list of 4
+      data["ranks"][pillar]          -> single pillar rank (1..4).
+    If only a single pillar rank exists, we default per-subtheme ranks to [2,2,2,2].
     """
-    col = PILLAR_COLOURS.get(pillar_key, "#999999")
+    ratings = None
+    ranks   = None
+
+    scores = data.get("scores", {}).get(pillar, {})
+    if isinstance(scores, dict) and scores:
+        vals = []
+        for sublabel in SUBTHEMES[pillar]:
+            candidates = [
+                sublabel,
+                sublabel.lower().replace(" ", "_"),
+                sublabel.lower(),
+            ]
+            v = None
+            for k in candidates:
+                if k in scores:
+                    v = scores[k]
+                    break
+            vals.append(0 if v in (None, "") else int(float(v)))
+        if len(vals) == 4:
+            ratings = vals
+    elif isinstance(scores, list) and len(scores) == 4:
+        ratings = _as_int_list(scores)
+
+    pr = data.get("ranks", {}).get(pillar)
+    if pr is not None:
+        try:
+            pr = int(pr)
+            if pr in (1, 2, 3, 4):
+                ranks = [2, 2, 2, 2]  # neutral default if only pillar rank was given
+        except Exception:
+            pass
+
+    return ratings, ranks
+
+def _fallback_guess(data, pillar):
+    """
+    Very loose fallback: health_1..health_4, health_sub1..sub4
+    """
+    ratings = []
+    loose_keys = [
+        f"{pillar}_1", f"{pillar}_2", f"{pillar}_3", f"{pillar}_4",
+        f"{pillar}_sub1", f"{pillar}_sub2", f"{pillar}_sub3", f"{pillar}_sub4",
+    ]
+    for k in loose_keys[:4]:
+        v = data.get(k)
+        ratings.append(0 if v in (None, "") else int(float(v)))
+    if len(ratings) == 4:
+        return ratings, None
+    return None, None
+
+def normalize_inputs(data):
+    """
+    Returns normalized dicts:
+      ratings[pillar] -> [int 0..5]*4
+      ranks[pillar]   -> [int 1..4]*4 (if missing/invalid, defaults to [1,2,3,4])
+    """
+    ratings = {}
+    ranks   = {}
+
+    if DEBUG_LOG:
+        try:
+            print(f"[payload] top-level keys: {list(data.keys())}")
+            if isinstance(data.get("ratings"), dict):
+                print(f"[payload] ratings keys: {list(data['ratings'].keys())}")
+            if isinstance(data.get("ranks_per_subtheme"), dict):
+                print(f"[payload] ranks_per_subtheme keys: {list(data['ranks_per_subtheme'].keys())}")
+        except Exception:
+            pass
+
+    for pillar in PILLARS:
+        r_new, rk_new = _try_new_shape(data, pillar)
+        r_old, rk_old = _try_legacy_shape(data, pillar)
+        r_fb, rk_fb   = _fallback_guess(data, pillar)
+
+        r = r_new or r_old or r_fb
+        if not r or len(r) != 4:
+            r = [0, 0, 0, 0]
+
+        rk = rk_new or rk_old or rk_fb
+        if not rk or len(rk) != 4:
+            rk = [1, 2, 3, 4]
+
+        ratings[pillar] = r
+        ranks[pillar]   = rk
+
+        if DEBUG_LOG:
+            print(f"[parsed] {pillar}: ratings={ratings[pillar]} ranks={ranks[pillar]}")
+
+    return ratings, ranks
+
+
+# -------------- Computation helpers --------------
+
+def rating_to_strength(score_0_to_5):
+    """Plot strength as 0..25 (visual space to match previous charts)."""
+    return float(score_0_to_5) * 5.0
+
+def compute_priority_gap(score, rank):
+    """
+    Simple interpretable 'gap' scaled similarly (0..25-ish):
+      bigger when rank is high (1 is most important -> weight 4)
+      and the score is low.
+    """
+    weight = RANK_WEIGHT.get(int(rank), 1)
+    gap = (5.0 - float(score)) * weight
+    return gap  # this typically ranges 0..20
+
+def pillar_summary_rows(ratings, ranks):
+    """
+    Return list of (pillar, raw_total, weighted_total, scaled_0_50, ranks_used_text)
+    """
+    rows = []
+    for pillar in PILLARS:
+        r = ratings[pillar]
+        rk = ranks[pillar]
+        raw_total = sum([rating_to_strength(x) for x in r])  # 0..100
+        weighted_total = 0.0
+        for s, rr in zip(r, rk):
+            w = RANK_WEIGHT.get(int(rr), 1)
+            weighted_total += rating_to_strength(s) * w / 4.0  # keep in 0..100-ish
+        scaled = weighted_total / 2.0  # to 0..50 scale (optional)
+        rows.append((
+            pillar.capitalize(),
+            f"{raw_total:.1f}",
+            f"{weighted_total:.1f}",
+            f"{scaled:.1f}",
+            ", ".join(str(x) for x in rk)
+        ))
+    return rows
+
+def find_top_gaps(ratings, ranks):
+    """
+    For each pillar, find the subtheme with the largest gap.
+    Also return the overall largest gap (pillar, index, gap).
+    """
+    per_pillar = []
+    overall = ("", -1, -1.0)  # (pillar, idx, gap)
+    for pillar in PILLARS:
+        r = ratings[pillar]
+        rk = ranks[pillar]
+        gaps = [compute_priority_gap(s, rr) for s, rr in zip(r, rk)]
+        best_idx = int(np.argmax(gaps))
+        per_pillar.append((pillar, best_idx, gaps[best_idx]))
+        if gaps[best_idx] > overall[2]:
+            overall = (pillar, best_idx, gaps[best_idx])
+    return per_pillar, overall
+
+
+# -------------- Plotting --------------
+
+def _bar_plot_for_pillar(pillar, ratings, ranks, fig_w=10, fig_h=6):
+    """
+    Return PNG bytes of the pillar bar chart.
+    Shows Strength vs Priority Gap, subtheme labels on x,
+    and the rank number above each bar pair (small text).
+    """
+    x_labels = SUBTHEMES[pillar]
+    scores   = ratings[pillar]
+    rk       = ranks[pillar]
+
+    strengths = [rating_to_strength(s) for s in scores]
+    gaps      = [compute_priority_gap(s, rr) for s, rr in zip(scores, rk)]
+
     x = np.arange(4)
-    width = 0.38
+    width = 0.35
 
-    fig, ax = plt.subplots(figsize=(8.8, 5.2))
-    r1 = ax.bar(x - width/2, raw, width, label="Strength (0–25)", color=col, alpha=0.45)
-    r2 = ax.bar(x + width/2, wtd, width, label="Priority Gap (0–25)", color=col, alpha=0.95)
+    plt.close("all")
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
-    ax.set_ylim(0, 25)
-    ax.axhline(12, linestyle="--", linewidth=0.8, color="#666666")
-    ax.axhline(18, linestyle="--", linewidth=0.8, color="#666666")
+    # bars
+    c_main = PILLAR_COLORS[pillar]
+    c_gap  = colors.HexColor(c_main)
+    strength_bars = ax.bar(x - width/2, strengths, width, label="Strength (0–25)", color=c_main, alpha=0.9)
+    gap_bars      = ax.bar(x + width/2, gaps,      width, label="Priority Gap (0–25)", color=c_main, alpha=0.55)
+
+    # gridlines to help read values (same as older look)
+    for y in [12, 18]:
+        ax.axhline(y, color="#bbbbbb", linestyle="--", linewidth=1, alpha=0.6)
+
+    # rank labels above the bar pairs
+    for xi, rnk in zip(x, rk):
+        ax.text(xi, max(strengths[xi], gaps[xi]) + 0.6, f"rank {int(rnk)}",
+                ha="center", va="bottom", fontsize=9, color="#444444")
+
+    # x tick labels (subthemes)
     ax.set_xticks(x)
-    ax.set_xticklabels(sub_names, rotation=12, ha="right")
+    ax.set_xticklabels(x_labels, rotation= -12, ha="right", fontsize=9)
+
+    ax.set_ylim(0, max(25, max(strengths + gaps) + 3))
     ax.set_ylabel("0–25 scale\n(higher Strength is better; higher Gap needs attention)")
-    ax.set_title(f"{pillar_label} – Strength vs Priority Gap (rank 1 = most important)")
+    ax.set_title(f"{pillar.capitalize()} – Strength vs Priority Gap (rank 1 = most important)", pad=10)
+
     ax.legend(loc="upper right")
+    fig.tight_layout()
 
-    # Value labels on the bars
-    for bars in (r1, r2):
-        for b in bars:
-            h = b.get_height()
-            ax.annotate(f"{h:.0f}", (b.get_x()+b.get_width()/2, h),
-                        textcoords="offset points", xytext=(0,3),
-                        ha="center", fontsize=8)
-
-    # --- Rank labels ABOVE each pair (no weights anywhere) ---
-    for i in range(4):
-        top = max(raw[i], wtd[i])
-        ax.text(x[i], top + 1.2, f"rank {ranks[i]}", ha="center", va="bottom", fontsize=9, fontweight="bold")
-
-    os.makedirs(CHARTS_DIR, exist_ok=True)
-    path = os.path.join(CHARTS_DIR, f"{pillar_key}_bars.png")
-    plt.tight_layout()
-    plt.savefig(path, dpi=200, bbox_inches="tight")
-    plt.close()
-    return path
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+    buf.seek(0)
+    return buf.getvalue()
 
 
-# ---------- main entry ----------
-def build_pdf_report(payload: dict, out_pdf: str):
-    os.makedirs(CHARTS_DIR, exist_ok=True)
+# -------------- PDF assembly --------------
 
-    # Resolve labels/meta
-    meta = _pillar_meta(payload)
-
-    # Build pillar structures
-    pillars = {}
-    for key in PILLAR_KEYS:
-        label     = meta[key]["label"]
-        sub_names = meta[key]["subthemes"]
-        raw       = _read_sub_scores(payload, key)          # 4 numbers 0..25
-        ranks     = _read_ranks(payload, key)               # 4 ints 1..4
-        factors   = _weights_from_ranks(ranks)
-        wtd       = [min(25.0, round(raw[i]*factors[i], 1)) for i in range(4)]
-        wild      = _read_wildcards(payload, key)           # [(q,a),...]
-
-        pillars[key] = {
-            "label": label, "sub_names": sub_names,
-            "raw": raw, "ranks": ranks, "factors": factors, "wtd": wtd,
-            "raw_total": sum(raw),
-            "wtd_total": sum(wtd),
-            "wtd_scaled": (sum(wtd) / 100.0) * 50.0,
-            "chart": _bar_chart(label, key, sub_names, raw, wtd, ranks),
-            "wild": wild,
-        }
-
-    # Spiderweb of weighted (0..50)
-    angles = np.linspace(0, 2*np.pi, 4, endpoint=False).tolist()
-    angles += angles[:1]
-    radar_vals = [pillars[k]["wtd_scaled"] for k in PILLAR_KEYS]
-    loop = radar_vals + radar_vals[:1]
-
-    plt.figure(figsize=(6.8, 6.8))
-    ax = plt.subplot(111, polar=True)
-    ax.plot(angles, loop, linewidth=2, color="#444444")
-    ax.fill(angles, loop, alpha=0.25, color="#999999")
-    ax.set_yticks([10,20,30,40,50])
-    ax.set_ylim(0, 50)
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels([pillars[k]["label"] for k in PILLAR_KEYS])
-    for lbl, k in zip(ax.get_xticklabels(), PILLAR_KEYS):
-        lbl.set_color(PILLAR_COLOURS.get(k, "#333"))
-    plt.title("Life Alignment Spiderweb (Weighted by Your Priorities — 1 = most important)",
-              fontsize=12, weight="bold")
-    radar_path = os.path.join(CHARTS_DIR, "radar_weighted_colour_flipped.png")
-    plt.savefig(radar_path, dpi=200, bbox_inches="tight")
-    plt.close()
-
-    # Largest gap across everything
-    lg_key, lg_idx, lg_gap = _largest_gap(pillars)
-
-    # ---------- Build PDF ----------
+def _styles():
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="Small", fontSize=9))
+    styles.add(ParagraphStyle(name="H1Big", fontSize=20, leading=24, spaceAfter=12, textColor=colors.black))
+    styles.add(ParagraphStyle(name="H2", fontSize=14, leading=18, spaceAfter=6, textColor=colors.black))
+    styles.add(ParagraphStyle(name="Small", fontSize=9, leading=12, textColor=colors.black))
+    return styles
 
-    doc = SimpleDocTemplate(
-        out_pdf,
-        pagesize=A4,
-        rightMargin=2*cm, leftMargin=2*cm,
-        topMargin=2*cm, bottomMargin=2*cm
+def _cover_block(data):
+    who  = data.get("name") or data.get("participant") or "Your Life Alignment"
+    when = datetime.utcnow().strftime("%d %b %Y")
+    return [
+        Paragraph("Life Alignment Diagnostic", _styles()["H1Big"]),
+        Paragraph(f"{who}", _styles()["H2"]),
+        Spacer(1, 6),
+        Paragraph(f"Generated: {when} (UTC)", _styles()["Small"]),
+        Spacer(1, 18),
+    ]
+
+def _priority_focus_block(ratings, ranks):
+    story = []
+    story.append(Paragraph("Priority Focus Summary", _styles()["H1Big"]))
+
+    per_pillar, overall = find_top_gaps(ratings, ranks)
+    for pillar, idx, gap in per_pillar:
+        s = ratings[pillar][idx]
+        r = ranks[pillar][idx]
+        label = SUBTHEMES[pillar][idx]
+        text = (
+            f"<b>{pillar.capitalize()} → {label}</b> "
+            f"(Gap {gap:.1f}; Strength {rating_to_strength(s):.0f}/25; rank {int(r)})<br/>"
+            f"This represents the area within your <b>{pillar.capitalize()}</b> Pillar in which your individual answers, "
+            f"and your overall priority given to <b>{label}</b>, are out of alignment. "
+            f"It is therefore the area to concentrate on first in order to make the biggest improvement for you."
+        )
+        story.append(Paragraph(text, _styles()["Small"]))
+        story.append(Spacer(1, 6))
+
+    op, oi, og = overall
+    if op:
+        s = ratings[op][oi]
+        r = ranks[op][oi]
+        label = SUBTHEMES[op][oi]
+        story.append(Paragraph("<b>Overall largest gap</b>", _styles()["H2"]))
+        text = (
+            f"<b>{op.capitalize()} → {label}</b> "
+            f"(Gap {og:.1f}; Strength {rating_to_strength(s):.0f}/25; rank {int(r)})<br/>"
+            f"This represents the single biggest opportunity to focus on next."
+        )
+        story.append(Paragraph(text, _styles()["Small"]))
+        story.append(Spacer(1, 6))
+
+    return story
+
+def _pillar_page(pillar, ratings, ranks):
+    story = []
+    story.append(Paragraph(PILLAR_TITLES[pillar], _styles()["H1Big"]))
+
+    # chart image
+    img_bytes = _bar_plot_for_pillar(pillar, ratings, ranks)
+    im = Image(io.BytesIO(img_bytes))
+    im._restrictSize(500, 320)
+    story.append(im)
+    story.append(Spacer(1, 6))
+
+    # line with ranks summary
+    rk = ", ".join(str(int(x)) for x in ranks[pillar])
+    line = (
+        f"<i>Participant importance ranks (1 = most important)</i>: "
+        f"{SUBTHEMES[pillar][0]}: {ranks[pillar][0]}, "
+        f"{SUBTHEMES[pillar][1]}: {ranks[pillar][1]}, "
+        f"{SUBTHEMES[pillar][2]}: {ranks[pillar][2]}, "
+        f"{SUBTHEMES[pillar][3]}: {ranks[pillar][3]}"
     )
+    story.append(Paragraph(line, _styles()["Small"]))
+    story.append(Spacer(1, 6))
+
+    return story
+
+def _summary_table(ratings, ranks):
+    headings = ["Pillar", "Raw Total (0–100)", "Weighted Total (0–100)", "Weighted Scaled (0–50)", "Ranks used (1=most)"]
+    rows = pillar_summary_rows(ratings, ranks)
+    data = [headings] + rows
+    t = Table(data, colWidths=[90, 120, 140, 140, 160])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.black),
+        ("ALIGN", (1,1), (-1,-1), "CENTER"),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+        ("BOTTOMPADDING", (0,0), (-1,0), 6),
+    ]))
+    return t
+
+# -------------- Public entry point --------------
+
+def build_pdf_report(payload, out_pdf=None):
+    """
+    Public entry point used by the API.
+    Accepts either:
+      build_pdf_report(data_dict)
+      build_pdf_report(data_dict, out_pdf_path)
+
+    Returns PDF bytes if out_pdf is None; otherwise writes the file and returns out path.
+    """
+    # If payload arrives as JSON string, decode
+    if isinstance(payload, (str, bytes)):
+        try:
+            data = json.loads(payload)
+        except Exception:
+            data = {}
+    else:
+        data = payload or {}
+
+    ratings, ranks = normalize_inputs(data)
+
+    # Assemble report
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=36, bottomMargin=36, leftMargin=42, rightMargin=42)
     story = []
 
     # Cover
-    date_str = datetime.now().strftime("%d %b %Y")
-    story += [
-        Spacer(1, 1.2*cm),
-        Paragraph("<para align='center'><font size=20><b>Life Alignment Diagnostic</b></font></para>", styles["Title"]),
-        Spacer(1, 0.5*cm),
-        Paragraph(f"<para align='center'>{date_str}</para>", styles["Normal"]),
-        Spacer(1, 0.5*cm),
-        PageBreak()
-    ]
+    story.extend(_cover_block(data))
+    story.append(Spacer(1, 6))
 
-    # Spiderweb page
-    story += [
-        Paragraph("<b>Spiderweb Summary (Weighted by Your Priorities — 1 = most important)</b>", styles["Heading1"]),
-        RLImage(radar_path, width=15*cm, height=15*cm),
-        Spacer(1, 0.2*cm)
-    ]
+    # Priority summary (first)
+    story.extend(_priority_focus_block(ratings, ranks))
+    story.append(PageBreak())
 
-    # Overview table
-    table_data = [["Pillar", "Raw Total (0–100)", "Weighted Total (0–100)", "Weighted Scaled (0–50)", "Ranks used (1=most)"]]
-    for k in PILLAR_KEYS:
-        p = pillars[k]
-        ranks_text = ", ".join(str(r) for r in p["ranks"])
-        table_data.append([
-            p["label"], f"{p['raw_total']:.0f}", f"{p['wtd_total']:.1f}", f"{p['wtd_scaled']:.1f}", ranks_text
-        ])
-    t = Table(table_data, colWidths=[5.5*cm, 3.5*cm, 3.5*cm, 3.5*cm, 4*cm])
-    t.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
-        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
-        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.black),
-    ]))
-    story += [t, PageBreak()]
-
-    # Per-pillar pages
-    for k in PILLAR_KEYS:
-        p   = pillars[k]
-        col = PILLAR_COLOURS.get(k, "#333333")
-
-        story += [
-            Paragraph(f"<font color='{col}'><b>{p['label']} Pillar</b></font>", styles["Heading1"]),
-            RLImage(p["chart"], width=16*cm, height=9*cm),
-            Spacer(1, 0.2*cm)
-        ]
-
-        # (Ranks paragraph removed – ranks are printed above the bars)
-
-        # Wildcards (if any)
-        if p["wild"]:
-            story.append(Paragraph("<b>Wildcard reflections (not scored):</b>", styles["Normal"]))
-            for q, a in p["wild"]:
-                if q:
-                    story.append(Paragraph(f"<b>Q:</b> {q}", styles["Small"]))
-                if a:
-                    story.append(Paragraph(f"<b>A:</b> {a}", styles["Small"]))
-            story.append(Spacer(1, 0.2*cm))
-
+    # Pillar pages
+    for pillar in PILLARS:
+        story.extend(_pillar_page(pillar, ratings, ranks))
         story.append(PageBreak())
 
-    # Priority focus summary (largest single gap)
-    story.append(Paragraph("<b>Priority Focus Summary</b>", styles["Heading1"]))
-    if lg_key in pillars and 0 <= lg_idx < 4:
-        best = pillars[lg_key]
-        story.append(Paragraph(
-            f"Your largest <b>priority gap</b> is in <b>{best['label']} → {best['sub_names'][lg_idx]}</b>: "
-            f"Strength {best['raw'][lg_idx]:.0f}/25; rank {best['ranks'][lg_idx]} (1 = most important). "
-            "This area appears both highly valued and currently under-supported — "
-            "focus here first for the fastest gains.",
-            styles["Normal"]
-        ))
-    else:
-        story.append(Paragraph("No ranked priorities detected; results reflect raw scores only.", styles["Normal"]))
+    # Spiderweb – disabled for now
+    if DRAW_SPIDER:
+        # kept intentionally blank until we reinstate with a square figure
+        pass
+
+    # Summary table
+    story.append(Paragraph("Summary", _styles()["H1Big"]))
+    story.append(_summary_table(ratings, ranks))
 
     doc.build(story)
+    pdf_bytes = buffer.getvalue()
+
+    if out_pdf:
+        with open(out_pdf, "wb") as f:
+            f.write(pdf_bytes)
+        return out_pdf
+
+    return pdf_bytes
