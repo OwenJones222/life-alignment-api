@@ -1,203 +1,135 @@
-# app.py — Life Alignment API (full replacement)
-# - CORS for your WP site
-# - Accepts both old (pillar-level) and new (subtheme-level) payloads
-# - Dynamically resolves report builder from generate_report_json.py
-# - Calls builder robustly (1-arg or 2-arg styles)
-# - Emails the PDF via Gmail SMTP using env SMTP_USER / SMTP_PASS
-
+import io
 import os
 import json
-import ssl
 import smtplib
-import importlib
-import inspect
-import tempfile
+import ssl
 from email.message import EmailMessage
-from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 # ----------------------------
-# Config from environment
+# App & CORS
 # ----------------------------
-SMTP_USER = os.getenv("SMTP_USER", "").strip()
-SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
-REPORT_FUNC = os.getenv("REPORT_FUNC", "").strip()
+app = FastAPI(title="Life Alignment API")
 
+# Allow your WP domain(s) – add more as needed
 ALLOWED_ORIGINS = [
     "https://queensparkfitness.com",
     "https://www.queensparkfitness.com",
 ]
-
-# ----------------------------
-# FastAPI app + CORS
-# ----------------------------
-app = FastAPI(title="Life Alignment API")
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS or ["*"],  # fall back if needed during testing
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ----------------------------
+# Report builder resolver
+# ----------------------------
+def _resolve_report_builder():
+    """
+    Locate a callable in generate_report_json that will build the PDF.
+    Supports:
+      - build_pdf_report(data) -> bytes
+      - build_pdf_report(data, out_pdf: io.BytesIO) -> None (writes to buffer)
+    Select with env REPORT_FUNC (default: build_pdf_report).
+    """
+    from generate_report_json import __dict__ as rpt
+
+    name = os.getenv("REPORT_FUNC", "build_pdf_report")
+    func = rpt.get(name)
+    if not callable(func):
+        raise ImportError(
+            f"REPORT_FUNC '{name}' not found/callable in generate_report_json.py"
+        )
+    print(f"[report] Using discovered builder: {name}()")
+    return func
+
+BUILD_REPORT = _resolve_report_builder()
+
+# ----------------------------
 # Email helper (Gmail SMTP)
 # ----------------------------
+SMTP_USER = os.getenv("SMTP_USER")  # your Gmail address
+SMTP_PASS = os.getenv("SMTP_PASS")  # the Gmail "App password"
+
 def send_email_with_attachment(
     to_email: str,
     subject: str,
     body_text: str,
-    attachment_path: str,
-    from_email: Optional[str] = None,
+    filename: str,
+    file_bytes: bytes,
 ) -> None:
-    """
-    Sends an email with a single PDF attachment using Gmail SMTP.
-    Requires SMTP_USER/SMTP_PASS env vars (App Password for Gmail).
-    """
-    from_email = from_email or SMTP_USER
     if not (SMTP_USER and SMTP_PASS):
-        raise RuntimeError("SMTP_USER/SMTP_PASS are not configured.")
+        raise RuntimeError("SMTP_USER/SMTP_PASS not configured in environment.")
 
     msg = EmailMessage()
-    msg["From"] = from_email
+    msg["From"] = SMTP_USER
     msg["To"] = to_email
     msg["Subject"] = subject
     msg.set_content(body_text)
 
-    # Attach PDF
-    with open(attachment_path, "rb") as f:
-        data = f.read()
-    filename = os.path.basename(attachment_path) or "Life_Alignment_Report.pdf"
     msg.add_attachment(
-        data,
+        file_bytes,
         maintype="application",
         subtype="pdf",
         filename=filename,
     )
 
     context = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.starttls(context=context)
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
 
-
 # ----------------------------
-# Resolve the report builder
+# Utilities
 # ----------------------------
-def _import_report_module():
+async def _read_tolerant_json(request: Request) -> dict:
     """
-    Import your local report builder module.
+    Try to parse JSON from WordPress/Elementor in a tolerant way.
+    - First, request.json()
+    - If that fails (e.g., urlencoded), read body and json.loads()
     """
-    return importlib.import_module("generate_report_json")
+    try:
+        return await request.json()
+    except Exception:
+        raw = await request.body()
+        try:
+            return json.loads(raw.decode("utf-8", errors="ignore"))
+        except Exception:
+            # last chance: empty / invalid
+            return {}
 
-
-def _resolve_report_builder():
+def _build_pdf_bytes(payload: dict) -> bytes:
     """
-    Pick the report builder function from generate_report_json.py.
-
-    Priority:
-    1) REPORT_FUNC env (exact name)
-    2) First match in a list of known names
+    Call the discovered report builder in a signature-tolerant way.
     """
-    module = _import_report_module()
+    buf = io.BytesIO()
+    try:
+        # Try 2-arg signature: (data, out_pdf)
+        result = BUILD_REPORT(payload, buf)  # type: ignore
+        if buf.getbuffer().nbytes > 0:
+            return buf.getvalue()
+        # If nothing wrote to buffer but result returned bytes, handle that too:
+        if isinstance(result, (bytes, bytearray)):
+            return bytes(result)
+    except TypeError:
+        # Fallback to 1-arg signature: (data) -> bytes
+        result = BUILD_REPORT(payload)  # type: ignore
+        if isinstance(result, (bytes, bytearray)):
+            return bytes(result)
+        # Some builders might still write to buf even if they accept one arg (unlikely)
+        if buf.getbuffer().nbytes > 0:
+            return buf.getvalue()
 
-    # If env var is set, try that first
-    if REPORT_FUNC:
-        fn = getattr(module, REPORT_FUNC, None)
-        if callable(fn):
-            app.logger if hasattr(app, "logger") else None
-            print(f"[report] Using REPORT_FUNC override: {REPORT_FUNC}()")
-            return fn
-        else:
-            print(f"[report] REPORT_FUNC='{REPORT_FUNC}' not found/callable.")
-
-    # Otherwise try known candidates
-    candidates = [
-        "build_pdf_report",
-        "build_pdf_from_payload",     # <- your current one
-        "generate_pdf_report",
-        "create_pdf_from_payload",
-        "create_pdf",
-        "build_report",
-        "generate_report",
-    ]
-
-    for name in candidates:
-        fn = getattr(module, name, None)
-        if callable(fn):
-            print(f"[report] Using discovered builder: {name}()")
-            return fn
-
-    raise ImportError(
-        "No suitable report builder found in generate_report_json.py. "
-        f"Expected one of: {', '.join(candidates)}"
+    raise RuntimeError(
+        "Report builder did not return bytes or write to buffer. "
+        "Ensure it implements either (data)->bytes or (data, out_pdf)->None."
     )
-
-
-BUILD_REPORT = _resolve_report_builder()
-
-# ----------------------------
-# Robust builder invocation
-# ----------------------------
-def _call_report_builder(builder, payload: Dict[str, Any]) -> str:
-    """
-    Call the report builder regardless of signature:
-    - 2-arg: builder(payload, out_pdf) -> writes to out_pdf, returns None
-    - 1-arg: builder(payload) -> returns path to the PDF
-    Also supports a fallback if the builder writes to a known default path.
-    Returns the absolute path to the PDF file.
-    """
-    sig = inspect.signature(builder)
-    params = [
-        p for p in sig.parameters.values()
-        if p.kind in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        )
-    ]
-
-    # 2-arg style -> provide a temp filename
-    if len(params) >= 2:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            out_pdf = tmp.name
-        builder(payload, out_pdf)
-        if os.path.exists(out_pdf):
-            return out_pdf
-        raise RuntimeError("Report builder (2-arg) did not write the expected PDF.")
-
-    # 1-arg style -> expect a returned path
-    result = builder(payload)
-    if isinstance(result, str) and os.path.exists(result):
-        return result
-
-    # Fallback: some builders always use a default path
-    default_path = "/tmp/Life_Alignment_Report.pdf"
-    if os.path.exists(default_path):
-        return default_path
-
-    raise RuntimeError("Report builder did not produce a PDF path.")
-
-
-# ----------------------------
-# Payload normaliser (tolerant)
-# ----------------------------
-def _normalise_payload(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Accepts older pillar-level schema and newer subtheme-level schema.
-    Just passes through what exists; the report builder already expects
-    the same keys you used before. If you need deeper transforms, add here.
-    """
-    # Example light-touch: ensure email is present and sane
-    email = (data.get("email") or "").strip()
-    if not email or "@" not in email:
-        raise HTTPException(status_code=422, detail="Valid email is required.")
-
-    # Nothing else enforced strictly; your report code uses its own parsing.
-    return data
-
 
 # ----------------------------
 # Routes
@@ -209,41 +141,35 @@ def root():
 @app.post("/generate")
 async def generate_report(request: Request):
     """
-    Accepts JSON payload posted by your Elementor form, builds the PDF report,
-    and emails it as an attachment to the user.
+    Accept the Elementor JSON payload, build the PDF, and email it to the user.
+    Also prints the raw payload (pretty JSON) to Render logs for debugging.
     """
-    try:
-        payload = await request.json()
-            import json, sys
-    print("\n==== PAYLOAD DEBUG ====\n", json.dumps(payload, indent=2), file=sys.stdout)
+    # 1) Read payload (tolerant)
+    payload = await _read_tolerant_json(request)
 
-    except Exception:
-        # Occasionally WP/Elementor can send urlencoded; try to decode gracefully
-        body = await request.body()
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid request body.")
-
+    # 2) DEBUG: dump the exact payload your form is sending
     try:
-        data = _normalise_payload(payload)
-    except HTTPException:
-        raise
+        print("\n==== PAYLOAD DEBUG ====")
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        print("==== END PAYLOAD DEBUG ====\n", flush=True)
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Invalid payload: {e}")
+        print(f"[warn] Could not pretty-print payload: {e}")
 
-    user_email = (data.get("email") or "").strip()
-    if not user_email:
-        raise HTTPException(status_code=422, detail="Email address is required.")
+    # 3) Build the PDF
+    pdf_bytes = _build_pdf_bytes(payload)
 
-    # Build PDF via whichever style the report builder uses
-    try:
-        pdf_path = _call_report_builder(BUILD_REPORT, data)
-    except Exception as e:
-        print(f"ERROR while building report: {e}")
-        raise HTTPException(status_code=500, detail=f"Report build failed: {e}")
+    # 4) Determine recipient
+    #    Adjust the keys below if your Elementor field names differ
+    to_email = (
+        payload.get("email")
+        or payload.get("user", {}).get("email")
+        or SMTP_USER  # fallback so we can still test
+    )
 
-    # Email it
+    if not to_email:
+        return {"ok": False, "error": "No destination email in payload and no SMTP_USER fallback."}
+
+    # 5) Email it
     subject = "Your Life Alignment Diagnostic Report"
     body = (
         "Hi there,\n\n"
@@ -255,28 +181,10 @@ async def generate_report(request: Request):
         "3) Start with the largest gap – one meaningful action this week is enough to build momentum\n\n"
         "I’ll follow up with guidance on how to interpret the results and options for next steps.\n\n"
         "Warm regards,\n"
-        "Owen Jones\n"
-        "—\n"
-        "Automated email from your Life Alignment system."
+        "Owen Jones\n—\nAutomated email from your Life Alignment system."
     )
 
-    try:
-        send_email_with_attachment(
-            to_email=user_email,
-            subject=subject,
-            body_text=body,
-            attachment_path=pdf_path,
-            from_email=SMTP_USER or "no-reply@life-alignment",
-        )
-    except Exception as e:
-        print(f"ERROR while emailing: {e}")
-        raise HTTPException(status_code=500, detail=f"Email send failed: {e}")
+    filename = "Life_Alignment_Report.pdf"
+    send_email_with_attachment(to_email, subject, body, filename, pdf_bytes)
 
-    # Cleanup temp file if we created one under /tmp
-    try:
-        if pdf_path.startswith("/tmp/") and os.path.exists(pdf_path):
-            os.remove(pdf_path)
-    except Exception:
-        pass
-
-    return {"ok": True, "message": "Report generated and emailed."}
+    return {"ok": True, "sent_to": to_email}
