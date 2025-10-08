@@ -214,6 +214,9 @@ async def generate_report(request: Request):
     """
     try:
         payload = await request.json()
+            import json, sys
+    print("\n==== PAYLOAD DEBUG ====\n", json.dumps(payload, indent=2), file=sys.stdout)
+
     except Exception:
         # Occasionally WP/Elementor can send urlencoded; try to decode gracefully
         body = await request.body()
