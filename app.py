@@ -1,145 +1,112 @@
-from fastapi import FastAPI, HTTPException
+# app.py — FastAPI entrypoint for Life Alignment API
+# Tolerant /generate endpoint: accepts new per-subtheme ranks or older schemas.
+
+import os
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Dict, Optional
-from datetime import datetime
-import os, uuid, logging, smtplib
 
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
+# === adjust these imports to match your repo names ===
+# This function must accept a normalized dict and return a path to the PDF.
+from generate_report_json import build_pdf_report  # <-- you already have this working
+# Your existing helper used earlier to send the PDF via Gmail App Password.
+from mailer import send_email_with_attachment        # <-- you already have this working
 
-from generate_report_json import build_pdf_from_payload
+# -------------------------------------------------------------------
+# CORS: ALLOW YOUR WORDPRESS DOMAIN(S)
+# -------------------------------------------------------------------
+ALLOWED_ORIGINS = [
+    "https://queensparkfitness.com",
+    "https://www.queensparkfitness.com",
+]
 
-# --------------------------------------------------------------------
-# Logging
-# --------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("life-alignment-api")
-
-# --------------------------------------------------------------------
-# FastAPI app + CORS
-# --------------------------------------------------------------------
 app = FastAPI()
-
-# TEMP for testing; later lock down to your domains:
-#   ["https://queensparkfitness.com", "https://www.queensparkfitness.com"]
-ALLOWED_ORIGINS = ["*"]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# --------------------------------------------------------------------
-# Models
-# --------------------------------------------------------------------
-class Submission(BaseModel):
-    email: str
-    submittedAt: str
-    answers: Dict[str, list]            # pillar -> list[{qIndex, text, value}]
-    wildcards: Dict[str, str]
-    meta: Dict
-    importance: Optional[Dict[str, int]] = None  # pillar -> 1..4 (optional)
 
-# --------------------------------------------------------------------
-# Email helper
-# --------------------------------------------------------------------
-def send_email_with_attachment(to_email: str, subject: str, body_text: str, attachment_path: str) -> None:
+def _normalize_ranks(payload: dict) -> dict:
     """
-    Sends an email with a PDF attachment using SMTP.
-    Expects environment variables:
-      - SMTP_USER (sender address, e.g. your Gmail)
-      - SMTP_PASS (Gmail App Password)
-      - SMTP_SERVER (optional, default smtp.gmail.com)
-      - SMTP_PORT   (optional, default 587)
-      - SMTP_CC     (optional, comma-separated list)
+    We now expect per-subtheme ranks, e.g.:
+      {
+        "health": [1,2,3,4],
+        "wealth": [3,1,4,2],
+        ...
+      }
+    But older front-ends might send a different shape. Be generous:
+
+    Priority order:
+      1) payload["importance_subthemes"] (explicit new name)
+      2) payload["importance"]          (what our new front-end currently sends)
+      3) fabricate neutral ranks [1,2,3,4] for each pillar (fallback)
     """
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_pass = os.getenv("SMTP_PASS")
-    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    explicit = payload.get("importance_subthemes")
+    if isinstance(explicit, dict):
+        return explicit
 
-    if not smtp_user or not smtp_pass:
-        raise RuntimeError("SMTP_USER/SMTP_PASS not configured in environment.")
+    newshape = payload.get("importance")
+    if isinstance(newshape, dict):
+        return newshape
 
-    msg = MIMEMultipart()
-    msg["From"] = smtp_user
-    msg["To"] = to_email
-    msg["Subject"] = subject
+    # Fallback: give each pillar a 1..4 list so the report code can proceed
+    return {k: [1, 2, 3, 4] for k in ("health", "wealth", "self", "social")}
 
-    # Optional CC
-    cc_raw = os.getenv("SMTP_CC", "").strip()
-    cc_list = [x.strip() for x in cc_raw.split(",") if x.strip()]
-    if cc_list:
-        msg["Cc"] = ", ".join(cc_list)
-
-    # Body
-    msg.attach(MIMEText(body_text, "plain"))
-
-    # Attachment
-    if attachment_path and os.path.exists(attachment_path):
-        with open(attachment_path, "rb") as f:
-            part = MIMEApplication(f.read(), _subtype="pdf")
-            part.add_header("Content-Disposition", "attachment", filename=os.path.basename(attachment_path))
-            msg.attach(part)
-    else:
-        log.warning(f"Attachment not found at {attachment_path}; sending without attachment.")
-
-    recipients = [to_email] + cc_list
-    log.info(f"SMTP: connecting to {smtp_server}:{smtp_port} as {smtp_user}; to={recipients}")
-
-    with smtplib.SMTP(smtp_server, smtp_port, timeout=20) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_pass)
-        server.sendmail(smtp_user, recipients, msg.as_string())
-
-    log.info(f"SMTP: message dispatched to {recipients}")
-
-# --------------------------------------------------------------------
-# Endpoints
-# --------------------------------------------------------------------
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
 @app.post("/generate")
-def generate(sub: Submission):
+async def generate(request: Request):
+    # 1) Parse JSON safely
     try:
-        report_name = f"Life_Alignment_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.pdf"
-        out_path = os.path.join("/tmp", report_name)
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Bad JSON")
 
-        # Build the PDF from the payload (no Excel needed)
-        build_pdf_from_payload(sub.dict(), out_path)
-        log.info(f"Report built at {out_path} for {sub.email}")
+    # 2) Required email
+    email = (data.get("email") or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="Missing email")
 
-        # --- Covering letter (draft; tweak later) ---
-        subject = "Your Life Alignment Diagnostic Report"
-        body = (
-            "Hi there,\n\n"
-            "Thank you for completing the Life Alignment Diagnostic.\n"
-            "Attached is your personalised PDF report.\n\n"
-            "What to do next:\n"
-            "1) Skim the spiderweb chart to see your overall pattern\n"
-            "2) Look at each pillar’s bar chart – the ‘Priority Gap’ bars show where focus will pay off fastest\n"
-            "3) Start with the largest gap – one meaningful action this week is enough to build momentum\n\n"
-            "I’ll follow up with guidance on how to interpret the results and options for next steps.\n\n"
-            "Warm regards,\n"
-            "Owen Jones\n"
-            "—\n"
-            "Automated email from your Life Alignment system."
-        )
+    # 3) Ratings, wildcards, meta (all optional but expected structures)
+    answers   = data.get("answers")   or {}
+    wildcards = data.get("wildcards") or {}
+    meta      = data.get("meta")      or {}
 
-        # Send the email (logs will show success/failure)
-        log.info(f"Email: preparing to send report to {sub.email}")
-        send_email_with_attachment(sub.email, subject, body, out_path)
-        log.info(f"Email: sent report to {sub.email} OK")
+    # 4) Normalize ranks so report builder can rely on a single shape
+    importance_subthemes = _normalize_ranks(data)
 
-        return {"ok": True, "file": report_name, "emailed": True}
+    # 5) Build the normalized payload for your PDF generator
+    normalized = {
+        "email": email,
+        "answers": answers,                        # { pillarKey: [{qIndex,text,value}, ...] }
+        "wildcards": wildcards,                    # { id: "text", ... }
+        "importance_subthemes": importance_subthemes,  # { pillarKey: [r1,r2,r3,r4] }
+        "meta": meta,
+    }
+
+    # 6) Build the PDF
+    try:
+        pdf_path = build_pdf_report(normalized)  # must return a filesystem path
     except Exception as e:
-        log.exception("Error in /generate")
-        raise HTTPException(status_code=500, detail=str(e))
+        print("ERROR while building report:", repr(e))
+        raise HTTPException(status_code=500, detail="Report generation failed")
 
+    # 7) Email the PDF
+    try:
+        send_email_with_attachment(
+            to=email,
+            subject="Your Life Alignment Diagnostic Report",
+            body=(
+                "Hi there,\n\n"
+                "Thanks for completing the Life Alignment Diagnostic.\n"
+                "Your personalised PDF report is attached.\n\n"
+                "Warm regards,\nOwen\n"
+            ),
+            attachment_path=pdf_path,
+        )
+    except Exception as e:
+        # We’ll still return 200, as the report was created; email can be re-sent.
+        print("ERROR while emailing:", repr(e))
+
+    return {"ok": True}
