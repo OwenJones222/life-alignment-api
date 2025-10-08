@@ -1,47 +1,73 @@
-# app.py — FastAPI entrypoint for Life Alignment API
-# Tolerant /generate endpoint: accepts new per-subtheme ranks or older schemas.
+# app.py — FastAPI for Life Alignment API
+# - Tolerant /generate endpoint (new per-subtheme ranks or legacy).
+# - Dynamically resolves your PDF builder function from generate_report_json.py.
 
 import os
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-# === adjust these imports to match your repo names ===
-# This function must accept a normalized dict and return a path to the PDF.
-from generate_report_json import build_pdf_report  # <-- you already have this working
-# Your existing helper used earlier to send the PDF via Gmail App Password.
-from mailer import send_email_with_attachment        # <-- you already have this working
+# ----------------------------
+# Import your report builder module and email helper
+# ----------------------------
+import generate_report_json as _report_mod  # your existing file
+from mailer import send_email_with_attachment  # your existing helper
 
-# -------------------------------------------------------------------
-# CORS: ALLOW YOUR WORDPRESS DOMAIN(S)
-# -------------------------------------------------------------------
+def _resolve_report_builder():
+    """
+    Find a callable in generate_report_json that builds a PDF and returns the path.
+    Tries multiple common names so we don't break if the function name differs.
+    """
+    candidates = (
+        "build_pdf_report",
+        "generate_pdf_report",
+        "create_pdf_from_payload",
+        "create_pdf",
+        "build_report",
+        "generate_report",
+    )
+    for name in candidates:
+        fn = getattr(_report_mod, name, None)
+        if callable(fn):
+            print(f"[report] Using builder function: {name}()")
+            return fn
+    raise ImportError(
+        "No suitable report builder found in generate_report_json.py. "
+        "Expected one of: " + ", ".join(candidates)
+    )
+
+BUILD_REPORT = _resolve_report_builder()
+
+# ----------------------------
+# FastAPI + CORS
+# ----------------------------
 ALLOWED_ORIGINS = [
     "https://queensparkfitness.com",
     "https://www.queensparkfitness.com",
 ]
+# Optionally allow a comma-separated env var to override (e.g., in Render)
+_env_origins = os.getenv("ALLOWED_ORIGINS")
+if _env_origins:
+    ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
 
-app = FastAPI()
+app = FastAPI(title="Life Alignment API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["POST", "OPTIONS"],
+    allow_methods=["POST", "OPTIONS", "GET"],
     allow_headers=["*"],
 )
 
-
+# ----------------------------
+# Helpers
+# ----------------------------
 def _normalize_ranks(payload: dict) -> dict:
     """
-    We now expect per-subtheme ranks, e.g.:
-      {
-        "health": [1,2,3,4],
-        "wealth": [3,1,4,2],
-        ...
-      }
-    But older front-ends might send a different shape. Be generous:
-
-    Priority order:
-      1) payload["importance_subthemes"] (explicit new name)
-      2) payload["importance"]          (what our new front-end currently sends)
-      3) fabricate neutral ranks [1,2,3,4] for each pillar (fallback)
+    We expect per-subtheme ranks: { pillarKey: [r1,r2,r3,r4] }.
+    Accepts either of:
+      - payload["importance_subthemes"] (preferred name)
+      - payload["importance"]          (what the current FE sends)
+    Otherwise, fabricate neutral ranks [1,2,3,4] for each pillar.
     """
     explicit = payload.get("importance_subthemes")
     if isinstance(explicit, dict):
@@ -51,13 +77,24 @@ def _normalize_ranks(payload: dict) -> dict:
     if isinstance(newshape, dict):
         return newshape
 
-    # Fallback: give each pillar a 1..4 list so the report code can proceed
+    # Fallback: neutral ranks (keeps report logic running)
     return {k: [1, 2, 3, 4] for k in ("health", "wealth", "self", "social")}
 
+# ----------------------------
+# Routes
+# ----------------------------
+@app.get("/")
+async def root():
+    return {
+        "ok": True,
+        "service": "Life Alignment API",
+        "docs": "/docs",
+        "generate": "/generate (POST)",
+    }
 
 @app.post("/generate")
 async def generate(request: Request):
-    # 1) Parse JSON safely
+    # 1) Parse JSON
     try:
         data = await request.json()
     except Exception:
@@ -68,31 +105,32 @@ async def generate(request: Request):
     if not email:
         raise HTTPException(status_code=400, detail="Missing email")
 
-    # 3) Ratings, wildcards, meta (all optional but expected structures)
+    # 3) Pull optional fields
     answers   = data.get("answers")   or {}
     wildcards = data.get("wildcards") or {}
     meta      = data.get("meta")      or {}
 
-    # 4) Normalize ranks so report builder can rely on a single shape
+    # 4) Normalize ranks for the report generator
     importance_subthemes = _normalize_ranks(data)
 
-    # 5) Build the normalized payload for your PDF generator
     normalized = {
         "email": email,
-        "answers": answers,                        # { pillarKey: [{qIndex,text,value}, ...] }
-        "wildcards": wildcards,                    # { id: "text", ... }
+        "answers": answers,                         # { pillarKey: [{qIndex,text,value}, ...] }
+        "wildcards": wildcards,                     # { id: "text", ... }
         "importance_subthemes": importance_subthemes,  # { pillarKey: [r1,r2,r3,r4] }
         "meta": meta,
     }
 
-    # 6) Build the PDF
+    # 5) Build the PDF
     try:
-        pdf_path = build_pdf_report(normalized)  # must return a filesystem path
+        pdf_path = BUILD_REPORT(normalized)  # must return a file path
+        if not pdf_path or not isinstance(pdf_path, str):
+            raise RuntimeError("Report builder did not return a file path.")
     except Exception as e:
         print("ERROR while building report:", repr(e))
         raise HTTPException(status_code=500, detail="Report generation failed")
 
-    # 7) Email the PDF
+    # 6) Email the PDF (non-fatal on failure)
     try:
         send_email_with_attachment(
             to=email,
@@ -106,7 +144,7 @@ async def generate(request: Request):
             attachment_path=pdf_path,
         )
     except Exception as e:
-        # We’ll still return 200, as the report was created; email can be re-sent.
+        # Still return 200; the PDF exists and can be re-sent.
         print("ERROR while emailing:", repr(e))
 
     return {"ok": True}
