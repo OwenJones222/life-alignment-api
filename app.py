@@ -1,16 +1,22 @@
 # app.py — FastAPI for Life Alignment API
-# - Tolerant /generate endpoint (new per-subtheme ranks or legacy).
-# - Dynamically resolves your PDF builder function from generate_report_json.py.
+# - Tolerant /generate endpoint (per-subtheme ranks or legacy).
+# - Dynamic report builder from generate_report_json.py.
+# - Built-in Gmail SMTP sender (no external mailer module).
 
 import os
+import smtplib
+import ssl
+from email.message import EmailMessage
+from mimetypes import guess_type
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # ----------------------------
-# Import your report builder module and email helper
+# Import your report builder module
 # ----------------------------
 import generate_report_json as _report_mod  # your existing file
-from mailer import send_email_with_attachment  # your existing helper
+
 
 def _resolve_report_builder():
     """
@@ -35,6 +41,7 @@ def _resolve_report_builder():
         "Expected one of: " + ", ".join(candidates)
     )
 
+
 BUILD_REPORT = _resolve_report_builder()
 
 # ----------------------------
@@ -44,7 +51,7 @@ ALLOWED_ORIGINS = [
     "https://queensparkfitness.com",
     "https://www.queensparkfitness.com",
 ]
-# Optionally allow a comma-separated env var to override (e.g., in Render)
+# Optionally override via env (comma-separated)
 _env_origins = os.getenv("ALLOWED_ORIGINS")
 if _env_origins:
     ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
@@ -59,14 +66,56 @@ app.add_middleware(
 )
 
 # ----------------------------
+# Email sender (Gmail SMTP)
+# ----------------------------
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))  # STARTTLS port
+EMAIL_USER = os.getenv("EMAIL_USER", "")  # your full Gmail address
+EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")  # 16-char app password
+
+
+def send_email_with_attachment(to: str, subject: str, body: str, attachment_path: str):
+    """
+    Sends an email with a single attachment via Gmail SMTP (App Password).
+    Non-HTML body (plain text). Raises on connection/auth errors.
+    """
+    if not EMAIL_USER or not EMAIL_APP_PASSWORD:
+        raise RuntimeError("EMAIL_USER or EMAIL_APP_PASSWORD env vars are not set.")
+
+    msg = EmailMessage()
+    msg["From"] = EMAIL_USER
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    # Attach file if present
+    if attachment_path and os.path.isfile(attachment_path):
+        mime_type, _ = guess_type(attachment_path)
+        maintype, subtype = (mime_type or "application/pdf").split("/", 1)
+        with open(attachment_path, "rb") as f:
+            msg.add_attachment(f.read(), maintype=maintype, subtype=subtype,
+                               filename=os.path.basename(attachment_path))
+    else:
+        print(f"[email] Warning: attachment not found: {attachment_path}")
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+        server.ehlo()
+        server.starttls(context=context)
+        server.ehlo()
+        server.login(EMAIL_USER, EMAIL_APP_PASSWORD)
+        server.send_message(msg)
+        print(f"[email] Sent to {to} with subject: {subject}")
+
+# ----------------------------
 # Helpers
 # ----------------------------
 def _normalize_ranks(payload: dict) -> dict:
     """
-    We expect per-subtheme ranks: { pillarKey: [r1,r2,r3,r4] }.
-    Accepts either of:
-      - payload["importance_subthemes"] (preferred name)
-      - payload["importance"]          (what the current FE sends)
+    Expect per-subtheme ranks: { pillarKey: [r1,r2,r3,r4] }.
+    Accept either:
+      - payload["importance_subthemes"] (preferred)
+      - payload["importance"] (current FE)
     Otherwise, fabricate neutral ranks [1,2,3,4] for each pillar.
     """
     explicit = payload.get("importance_subthemes")
@@ -77,7 +126,6 @@ def _normalize_ranks(payload: dict) -> dict:
     if isinstance(newshape, dict):
         return newshape
 
-    # Fallback: neutral ranks (keeps report logic running)
     return {k: [1, 2, 3, 4] for k in ("health", "wealth", "self", "social")}
 
 # ----------------------------
@@ -92,6 +140,7 @@ async def root():
         "generate": "/generate (POST)",
     }
 
+
 @app.post("/generate")
 async def generate(request: Request):
     # 1) Parse JSON
@@ -105,19 +154,19 @@ async def generate(request: Request):
     if not email:
         raise HTTPException(status_code=400, detail="Missing email")
 
-    # 3) Pull optional fields
-    answers   = data.get("answers")   or {}
+    # 3) Optional fields
+    answers = data.get("answers") or {}
     wildcards = data.get("wildcards") or {}
-    meta      = data.get("meta")      or {}
+    meta = data.get("meta") or {}
 
     # 4) Normalize ranks for the report generator
     importance_subthemes = _normalize_ranks(data)
 
     normalized = {
         "email": email,
-        "answers": answers,                         # { pillarKey: [{qIndex,text,value}, ...] }
-        "wildcards": wildcards,                     # { id: "text", ... }
-        "importance_subthemes": importance_subthemes,  # { pillarKey: [r1,r2,r3,r4] }
+        "answers": answers,                           # { pillarKey: [{qIndex,text,value}, ...] }
+        "wildcards": wildcards,                       # { id: "text", ... }
+        "importance_subthemes": importance_subthemes, # { pillarKey: [r1,r2,r3,r4] }
         "meta": meta,
     }
 
