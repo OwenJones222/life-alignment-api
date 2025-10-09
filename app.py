@@ -182,6 +182,34 @@ async def generate_report(request: Request):
         "I’ll follow up with guidance on how to interpret the results and options for next steps.\n\n"
         "Warm regards,\n"
         "Owen Jones\n—\nAutomated email from your Life Alignment system."
+        Hi [First Name],
+
+Thank you for completing the Life Alignment Diagnostic.
+
+Attached is your personalised PDF report — a clear visual snapshot of where your priorities and day-to-day experience may not always align.
+
+Here’s how to read your results:
+
+1) Each page shows one of the four pillars — Health, Wealth, Self and Social — with a set of bar charts.
+   The lighter bars show your overall “Strength” in that area, while the darker “Priority Gap” bars show where there’s most room to grow.
+
+2) Below each chart you’ll see your Wildcard reflections — your own written notes.
+   These can give valuable insight when thinking about why certain areas scored the way they did or what might help them shift.
+
+3) Interpreting the Priority Gaps:
+   • When a sub-category is marked as “most important to me” and the individual question scores were already high (4s or 5s), the gap will be small — that usually means things are on track and no major action is needed.
+   • When a sub-category is “most important” but the question scores were lower (1s or 2s), the gap will be larger — this is where small, deliberate changes are likely to make the biggest difference.
+
+The report is designed to highlight opportunities, not shortcomings. Even one small action in a high-priority area can start to restore balance quickly.
+
+If you opted for the coaching session, we’ll explore these findings together and agree your first steps. 
+Otherwise, take a few minutes to reflect on what stands out — awareness is the first step toward realignment.
+
+Warm regards,
+Owen Jones
+—
+Automated email from your Life Alignment system.
+
     )
 
     filename = "Life_Alignment_Report.pdf"
