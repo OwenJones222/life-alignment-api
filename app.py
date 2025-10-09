@@ -70,6 +70,19 @@ def send_email_with_attachment(
     msg["From"] = SMTP_USER
     msg["To"] = to_email
     msg["Subject"] = subject
+
+    # Optional CC from environment variable (comma-separated list)
+    smtp_cc = os.getenv("SMTP_CC", "")
+    if smtp_cc:
+        cc_list = [addr.strip() for addr in smtp_cc.split(",") if addr.strip()]
+        if cc_list:
+            msg["Cc"] = ", ".join(cc_list)
+            to_send = [to_email] + cc_list
+        else:
+            to_send = [to_email]
+    else:
+        to_send = [to_email]
+
     msg.set_content(body_text)
 
     msg.add_attachment(
@@ -83,7 +96,7 @@ def send_email_with_attachment(
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.starttls(context=context)
         server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg)
+        server.send_message(msg, to_addrs=to_send)
 
 # ----------------------------
 # Utilities
@@ -159,7 +172,6 @@ async def generate_report(request: Request):
     pdf_bytes = _build_pdf_bytes(payload)
 
     # 4) Determine recipient
-    #    Adjust the keys below if your Elementor field names differ
     to_email = (
         payload.get("email")
         or payload.get("user", {}).get("email")
@@ -171,18 +183,8 @@ async def generate_report(request: Request):
 
     # 5) Email it
     subject = "Your Life Alignment Diagnostic Report"
-    body = (
-        "Hi there,\n\n"
-        "Thank you for completing the Life Alignment Diagnostic.\n"
-        "Attached is your personalised PDF report.\n\n"
-        "What to do next:\n"
-        "1) Skim the spiderweb chart to see your overall pattern\n"
-        "2) Look at each pillar’s bar chart – the ‘Priority Gap’ bars show where focus will pay off fastest\n"
-        "3) Start with the largest gap – one meaningful action this week is enough to build momentum\n\n"
-        "I’ll follow up with guidance on how to interpret the results and options for next steps.\n\n"
-        "Warm regards,\n"
-        "Owen Jones\n—\nAutomated email from your Life Alignment system."
-        Hi [First Name],
+    body = """\
+Hi [First Name],
 
 Thank you for completing the Life Alignment Diagnostic.
 
@@ -209,8 +211,7 @@ Warm regards,
 Owen Jones
 —
 Automated email from your Life Alignment system.
-
-    )
+"""
 
     filename = "Life_Alignment_Report.pdf"
     send_email_with_attachment(to_email, subject, body, filename, pdf_bytes)
