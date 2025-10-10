@@ -1,7 +1,8 @@
 # generate_report_json.py
-# OPTION A (with color fix):
+# OPTION A (cover polish + no TrailKube text + color fix)
 # - Keeps your calculations, ranks, gaps, wildcards, and summary as-is
-# - Adds: cover page (no header/footer), intro page, branded header/footer on internals
+# - Cover page: centered title/date, teal band at bottom with mint accent line (no header/footer)
+# - Header/footer on internal pages only; footer text: "Life Alignment Diagnostic"
 # - Chart colours: Strength = sage (#e2ebca), Priority Gap = teal (#1b6c7a)
 # - Supports:
 #       build_pdf_report(data) -> bytes
@@ -15,7 +16,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm, cm
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle, KeepTogether
+    SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle
 )
 from reportlab.lib import colors
 from reportlab.lib.colors import HexColor as RLHexColor
@@ -25,7 +26,7 @@ from reportlab.lib.colors import HexColor as RLHexColor
 # -----------------------
 BRAND = {
     "name": "Life Alignment Diagnostic",
-    "logo_path": os.getenv("BRAND_LOGO", "assets/trailkube-logo.png"),
+    "logo_path": os.getenv("BRAND_LOGO", "assets/trailkube-logo.png"),  # optional; not required
     "sage": "#e2ebca",   # Strength bars
     "teal": "#1b6c7a",   # Priority Gap bars + headers
     "mint": "#31dea4",   # thin accent line
@@ -66,7 +67,7 @@ def _sum_subtheme(values: List[int], slice_tuple: Tuple[int, int]) -> int:
     a, b = slice_tuple
     return sum(int(v) for v in values[a:b])
 
-# ------- NEW: styles & page furniture (non-disruptive) -------
+# ------- Styles & page furniture -------
 
 def _styles():
     s = getSampleStyleSheet()
@@ -75,13 +76,15 @@ def _styles():
     s["BodyText"].leading = 14
     # Extra styles
     if "TitleXL" not in s:
-        s.add(ParagraphStyle(name="TitleXL", fontSize=28, leading=32, textColor=TEAL_RL, spaceAfter=10))
+        s.add(ParagraphStyle(name="TitleXL", fontSize=28, leading=32, textColor=TEAL_RL, spaceAfter=10, alignment=1))  # centered
     if "H1Teal" not in s:
         s.add(ParagraphStyle(name="H1Teal", parent=s["Heading1"], textColor=TEAL_RL))
     if "H2Teal" not in s:
         s.add(ParagraphStyle(name="H2Teal", parent=s["Heading2"], textColor=TEAL_RL))
     if "SmallGrey" not in s:
-        s.add(ParagraphStyle(name="SmallGrey", fontSize=9, leading=12, textColor=colors.grey))
+        s.add(ParagraphStyle(name="SmallGrey", fontSize=9, leading=12, textColor=colors.grey, alignment=1))  # centered
+    if "BodyCenter" not in s:
+        s.add(ParagraphStyle(name="BodyCenter", parent=s["BodyText"], alignment=1))
     return s
 
 def _safe_logo(max_w=140, max_h=140):
@@ -114,10 +117,10 @@ def _on_page(canvas, doc):
     canvas.setFont("Helvetica-Bold", 10)
     canvas.drawString(doc.leftMargin, doc.height + doc.topMargin + 3, BRAND["name"])
 
-    # Footer
+    # Footer (remove TrailKube mention)
     canvas.setFillColor(colors.grey)
     canvas.setFont("Helvetica", 9)
-    canvas.drawString(doc.leftMargin, 1.2*cm, "TrailKube • Life Alignment")
+    canvas.drawString(doc.leftMargin, 1.2*cm, BRAND["name"])
     canvas.drawRightString(doc.leftMargin + doc.width, 1.2*cm, f"Page {doc.page}")
 
     canvas.restoreState()
@@ -128,7 +131,7 @@ def _section_header(title: str):
     line.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), MINT_RL)]))
     return [Paragraph(title, s["H1Teal"]), Spacer(0, 2), line, Spacer(0, 8)]
 
-# ---------- existing chart function (with brand colours) ----------
+# ---------- chart function (brand colours) ----------
 def _draw_pillar_chart(
     pillar_label: str,
     subtheme_labels: List[str],
@@ -169,40 +172,46 @@ def _draw_pillar_chart(
     plt.close(fig)
     return buf.getvalue()
 
-def _paragraph(text: str):
-    return Paragraph(text, getSampleStyleSheet()["BodyText"])
-
-def _heading(text: str, level=1):
-    styles = getSampleStyleSheet()
-    style = styles["Heading1"] if level == 1 else styles["Heading2"]
-    return Paragraph(text, style)
-
 # -----------------------
-# NEW: cover & intro pages
+# Cover & intro pages
 # -----------------------
 def _today_str():
     import datetime
     return datetime.datetime.now().strftime("%d %b %Y")
 
 def _cover_story():
+    """
+    Mockup-style cover:
+    - Optional logo (ignored if missing)
+    - Centered title + date
+    - Teal band at bottom with mint accent line above it
+    - No header/footer on this page
+    """
     s = _styles()
     story = []
-    logo = _safe_logo()
+
+    # Optional logo (kept small, centered; if present)
+    logo = _safe_logo(max_w=140, max_h=140)
     if logo:
-        story += [Spacer(0, 24), logo, Spacer(0, 18)]
+        story += [Spacer(0, 28), logo, Spacer(0, 12)]
+
+    # Centered title and date
     story += [
         Paragraph("LIFE ALIGNMENT DIAGNOSTIC", s["TitleXL"]),
         Spacer(0, 6),
-        Paragraph("Generated on:", s["SmallGrey"]),
-        Paragraph(_today_str(), s["BodyText"]),
-        Spacer(0, 18),
+        Paragraph(_today_str(), s["SmallGrey"]),
+        Spacer(0, 240),  # push content up to allow space for bottom band
     ]
-    band = Table([[""]], colWidths=[160*mm], rowHeights=[14])
-    band.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), TEAL_RL),
-        ("LINEABOVE", (0, 0), (-1, -1), 4, MINT_RL),
-    ]))
-    story += [Spacer(0, 320), band, PageBreak()]
+
+    # Bottom brand bands
+    # Mint accent line above teal band — both pinned at bottom of flow
+    mint_line = Table([[""]], colWidths=[160*mm], rowHeights=[4])
+    mint_line.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), MINT_RL)]))
+
+    teal_band = Table([[""]], colWidths=[160*mm], rowHeights=[14])
+    teal_band.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), TEAL_RL)]))
+
+    story += [mint_line, teal_band, PageBreak()]
     return story
 
 def _intro_story():
